@@ -232,7 +232,7 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
             sink.write(done_event.c_str(), done_event.length());
             sink.done();
             llama_sampler_free(chain);
-            return true;
+            return false;
         });
     } else {
         // Non-streaming response
