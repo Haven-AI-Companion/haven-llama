@@ -27,6 +27,11 @@ struct HavenEngineState {
     int n_threads = 8;
     int n_batch = 2048;
     int n_ubatch = 512;
+
+    // Telemetry tracking
+    uint64_t total_eval_tokens = 0;
+    uint64_t total_gen_tokens = 0;
+    double last_gen_tps = 0.0;
 };
 
 static HavenEngineState g_state;
@@ -68,6 +73,7 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
     cparams.n_ubatch = 512;
     cparams.n_threads = n_threads;
     cparams.n_threads_batch = n_threads;
+    cparams.embeddings = true; // Enable embeddings capability
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
@@ -80,6 +86,95 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
     g_state.active_model_path = path;
     std::cout << "[haven-engine] GGUF Model Loaded Successfully!" << std::endl;
     return true;
+}
+
+static void handle_embeddings(const httplib::Request & req, httplib::Response & res) {
+    set_cors_headers(res);
+
+    json request_json;
+    try {
+        request_json = json::parse(req.body);
+    } catch (...) {
+        res.status = 400;
+        res.set_content("{\"error\": \"Invalid JSON request\"}", "application/json");
+        return;
+    }
+
+    std::string input = "";
+    if (request_json.contains("input")) {
+        if (request_json["input"].is_string()) {
+            input = request_json["input"].get<std::string>();
+        } else if (request_json["input"].is_array() && !request_json["input"].empty()) {
+            if (request_json["input"][0].is_string()) {
+                input = request_json["input"][0].get<std::string>();
+            }
+        }
+    }
+
+    if (input.empty()) {
+        res.status = 400;
+        res.set_content("{\"error\": \"input string required\"}", "application/json");
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_state.engine_mutex);
+
+    if (!g_state.model || !g_state.ctx) {
+        res.status = 500;
+        res.set_content("{\"error\": \"No active model loaded\"}", "application/json");
+        return;
+    }
+
+    // Synchronize and clear memory
+    llama_synchronize(g_state.ctx);
+    llama_memory_clear(llama_get_memory(g_state.ctx), true);
+
+    // Tokenize
+    std::vector<llama_token> tokens(input.length() + 32);
+    int n_tokens = llama_tokenize(g_state.vocab, input.c_str(), input.length(), tokens.data(), tokens.size(), true, true);
+    if (n_tokens < 0) {
+        tokens.resize(-n_tokens);
+        n_tokens = llama_tokenize(g_state.vocab, input.c_str(), input.length(), tokens.data(), tokens.size(), true, true);
+    }
+    tokens.resize(n_tokens);
+
+    // Decode prompt for embeddings
+    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
+    if (llama_decode(g_state.ctx, batch) != 0) {
+        res.status = 500;
+        res.set_content("{\"error\": \"Failed to compute embeddings\"}", "application/json");
+        return;
+    }
+
+    // Extract sequence embeddings
+    int n_embd = llama_model_n_embd(g_state.model);
+    float * embd_res = llama_get_embeddings_seq(g_state.ctx, 0);
+    if (!embd_res) {
+        embd_res = llama_get_embeddings(g_state.ctx);
+    }
+
+    std::vector<float> embedding_vec(n_embd, 0.0f);
+    if (embd_res) {
+        for (int i = 0; i < n_embd; ++i) {
+            embedding_vec[i] = embd_res[i];
+        }
+    }
+
+    json response = {
+        {"object", "list"},
+        {"data", json::array({{
+            {"object", "embedding"},
+            {"embedding", embedding_vec},
+            {"index", 0}
+        }})},
+        {"model", g_state.active_model_alias},
+        {"usage", {
+            {"prompt_tokens", n_tokens},
+            {"total_tokens", n_tokens}
+        }}
+    };
+
+    res.set_content(response.dump(), "application/json");
 }
 
 static void handle_chat_completion(const httplib::Request & req, httplib::Response & res) {
@@ -116,7 +211,17 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
 
     std::string user_gender_str = request_json.value("user_gender", "female");
     std::string user_name = request_json.value("user_name", "Daniel");
+    
+    // Sampling Hyperparameters
     float temp = request_json.value("temperature", 0.7f);
+    float top_p = request_json.value("top_p", 0.9f);
+    float min_p = request_json.value("min_p", 0.05f);
+    int top_k = request_json.value("top_k", 40);
+    float typical_p = request_json.value("typical_p", 1.0f);
+    float penalty_repeat = request_json.value("repeat_penalty", request_json.value("frequency_penalty", 1.1f));
+    float penalty_freq = request_json.value("presence_penalty", 0.0f);
+    float penalty_present = request_json.value("presence_penalty", 0.0f);
+    int penalty_last_n = request_json.value("repeat_last_n", 64);
     int max_tokens = request_json.value("max_tokens", request_json.value("n_predict", 1024));
 
     if (prompt.empty()) {
@@ -146,9 +251,8 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     if (n_eot < 1 || im_end_id == LLAMA_TOKEN_NULL) {
         im_end_id = 107; // Fallback to Gemma <|im_end|> token ID
     }
-    std::cout << "[haven-engine] Identified <|im_end|> Token ID: " << im_end_id << std::endl;
 
-    // Configure C++ Haven Sampler
+    // Configure C++ Haven Zero-Drift Sampler
     haven_sampler_options h_opts;
     h_opts.user_name = user_name;
     h_opts.enable_pronoun_masking = true;
@@ -179,12 +283,30 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     }
     tokens.resize(n_tokens);
 
-    // Build Sampler Chain
+    // Build Full Sampler Chain (Haven Zero-Drift + Penalties + Min-P + Top-P + Temp)
     struct llama_sampler * haven_smpl = llama_sampler_init_haven(g_state.vocab, h_opts);
     struct llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
     llama_sampler_chain_add(chain, haven_smpl);
+
+    if (penalty_repeat != 1.0f || penalty_freq != 0.0f || penalty_present != 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_penalties(penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
+    }
+    if (top_k > 0) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(top_k));
+    }
+    if (typical_p < 1.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_typical(typical_p, 1));
+    }
+    if (top_p < 1.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(top_p, 1));
+    }
+    if (min_p > 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_min_p(min_p, 1));
+    }
     llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    auto start_time = std::chrono::high_resolution_clock::now();
 
     // Chunked prompt token evaluation (handles large prompt inputs cleanly)
     const size_t batch_size = 512;
@@ -199,13 +321,15 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         }
     }
 
+    g_state.total_eval_tokens += tokens.size();
+
     bool stream = request_json.value("stream", true);
     auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     std::string req_id = "chatcmpl-haven-" + std::to_string(now_ts);
 
     if (stream) {
         // Stream responses SSE with lock captured until completion
-        res.set_chunked_content_provider("text/event-stream", [lock, chain, im_end_id, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
+        res.set_chunked_content_provider("text/event-stream", [lock, chain, im_end_id, max_tokens, req_id, now_ts, start_time](size_t offset, httplib::DataSink & sink) mutable {
             if (!chain) {
                 return false;
             }
@@ -256,6 +380,13 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 n_decoded++;
             }
 
+            auto end_time = std::chrono::high_resolution_clock::now();
+            double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+            if (elapsed_sec > 0.0 && n_decoded > 0) {
+                g_state.last_gen_tps = n_decoded / elapsed_sec;
+                g_state.total_gen_tokens += n_decoded;
+            }
+
             std::string done_event = "data: [DONE]\n\n";
             sink.write(done_event.c_str(), done_event.length());
             sink.done();
@@ -297,6 +428,13 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
             n_decoded++;
         }
         llama_sampler_free(chain);
+
+        auto end_time = std::chrono::high_resolution_clock::now();
+        double elapsed_sec = std::chrono::duration<double>(end_time - start_time).count();
+        if (elapsed_sec > 0.0 && n_decoded > 0) {
+            g_state.last_gen_tps = n_decoded / elapsed_sec;
+            g_state.total_gen_tokens += n_decoded;
+        }
 
         json resp = {
             {"id", req_id},
@@ -364,7 +502,7 @@ int main(int argc, char ** argv) {
         res.status = 200;
     });
 
-    // 1. Health & Models Endpoints
+    // 1. Health & Telemetry Metrics Endpoints
     auto health_handler = [](const httplib::Request &, httplib::Response & res) {
         set_cors_headers(res);
         json response = {
@@ -372,12 +510,31 @@ int main(int argc, char ** argv) {
             {"engine", "haven-llama-cpp"},
             {"active_model", g_state.active_model_path},
             {"alias", g_state.active_model_alias},
-            {"zero_drift_sampler", true}
+            {"zero_drift_sampler", true},
+            {"tokens_per_second", g_state.last_gen_tps},
+            {"total_eval_tokens", g_state.total_eval_tokens},
+            {"total_gen_tokens", g_state.total_gen_tokens}
         };
         res.set_content(response.dump(2), "application/json");
     };
     svr.Get("/health", health_handler);
     svr.Get("/v1/health", health_handler);
+
+    svr.Get("/metrics", [](const httplib::Request &, httplib::Response & res) {
+        set_cors_headers(res);
+        json response = {
+            {"status", "ok"},
+            {"engine", "haven-llama-cpp"},
+            {"active_model", g_state.active_model_path},
+            {"n_ctx", g_state.default_n_ctx},
+            {"n_threads", g_state.n_threads},
+            {"gpu_layers", g_state.default_gpu_layers},
+            {"last_gen_tps", g_state.last_gen_tps},
+            {"total_eval_tokens", g_state.total_eval_tokens},
+            {"total_gen_tokens", g_state.total_gen_tokens}
+        };
+        res.set_content(response.dump(2), "application/json");
+    });
 
     svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
         set_cors_headers(res);
@@ -393,7 +550,11 @@ int main(int argc, char ** argv) {
         res.set_content(response.dump(2), "application/json");
     });
 
-    // 2. Model Hot-Swap Endpoint
+    // 2. Vector Embeddings Endpoints
+    svr.Post("/v1/embeddings", handle_embeddings);
+    svr.Post("/embedding", handle_embeddings);
+
+    // 3. Model Hot-Swap Endpoint
     svr.Post("/v1/haven/model/load", [](const httplib::Request & req, httplib::Response & res) {
         set_cors_headers(res);
         try {
@@ -422,7 +583,7 @@ int main(int argc, char ** argv) {
         }
     });
 
-    // 3. Multi-Route Chat & Completion Endpoints
+    // 4. Multi-Route Chat & Completion Endpoints
     svr.Post("/v1/chat/completions", handle_chat_completion);
     svr.Post("/v1/completions", handle_chat_completion);
     svr.Post("/completion", handle_chat_completion);
