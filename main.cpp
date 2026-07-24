@@ -133,9 +133,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         return;
     }
 
-    // Clear memory sequences safely before evaluating new prompt context
+    // Clear memory metadata and reset position cursor to 0 before evaluating new prompt context
     if (g_state.ctx) {
-        llama_memory_seq_rm(llama_get_memory(g_state.ctx), -1, 0, -1);
+        llama_memory_clear(llama_get_memory(g_state.ctx), false);
     }
 
     // Configure C++ Haven Sampler
@@ -205,6 +205,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 int len = llama_token_to_piece(g_state.vocab, id, buf, sizeof(buf), 0, true);
                 if (len > 0) {
                     std::string token_str(buf, len);
+                    if (token_str.find("<|im_end|>") != std::string::npos || token_str.find("<eos>") != std::string::npos) {
+                        break;
+                    }
                     json chunk = {
                         {"id", req_id},
                         {"object", "chat.completion.chunk"},
