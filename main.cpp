@@ -218,6 +218,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                     if (token_str.find("<|im_end|>") != std::string::npos || token_str.find("<eos>") != std::string::npos) {
                         break;
                     }
+                    if (token_str.find("<|channel") != std::string::npos || token_str.find("<|thought") != std::string::npos || token_str.find("<|call") != std::string::npos) {
+                        continue;
+                    }
                     json chunk = {
                         {"id", req_id},
                         {"object", "chat.completion.chunk"},
@@ -272,6 +275,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 std::string token_str(buf, len);
                 if (token_str.find("<|im_end|>") != std::string::npos || token_str.find("<eos>") != std::string::npos) {
                     break;
+                }
+                if (token_str.find("<|channel") != std::string::npos || token_str.find("<|thought") != std::string::npos || token_str.find("<|call") != std::string::npos) {
+                    continue;
                 }
                 full_response.append(buf, len);
             }
