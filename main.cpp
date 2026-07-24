@@ -9,6 +9,7 @@
 #include <mutex>
 #include <thread>
 #include <algorithm>
+#include <chrono>
 
 using json = nlohmann::json;
 
@@ -18,15 +19,25 @@ struct HavenEngineState {
     struct llama_context * ctx = nullptr;
     const struct llama_vocab * vocab = nullptr;
     std::string active_model_path = "";
+    std::string active_model_alias = "haven-chat";
     int port = 11436;
     std::string host = "0.0.0.0";
-    int default_n_ctx = 4096;
+    int default_n_ctx = 16384;
     int default_gpu_layers = 99;
+    int n_threads = 8;
+    int n_batch = 2048;
+    int n_ubatch = 512;
 };
 
 static HavenEngineState g_state;
 
-static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ctx = 4096) {
+static void set_cors_headers(httplib::Response & res) {
+    res.set_header("Access-Control-Allow-Origin", "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+}
+
+static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ctx = 16384, int n_threads = 8, int n_batch = 2048) {
     std::lock_guard<std::mutex> lock(g_state.engine_mutex);
 
     if (g_state.ctx) {
@@ -41,7 +52,7 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = n_gpu_layers;
 
-    std::cout << "[haven-engine] Loading GGUF Model: " << path << std::endl;
+    std::cout << "[haven-engine] Loading GGUF Model: " << path << " (GPU Layers: " << n_gpu_layers << ", Threads: " << n_threads << ", CTX: " << n_ctx << ")" << std::endl;
     g_state.model = llama_model_load_from_file(path.c_str(), mparams);
     if (!g_state.model) {
         std::cerr << "[haven-engine] Failed to load GGUF model file." << std::endl;
@@ -52,7 +63,10 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
-    cparams.n_batch = 2048;
+    cparams.n_batch = n_batch;
+    cparams.n_ubatch = 512;
+    cparams.n_threads = n_threads;
+    cparams.n_threads_batch = n_threads;
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
@@ -68,6 +82,8 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
 }
 
 static void handle_chat_completion(const httplib::Request & req, httplib::Response & res) {
+    set_cors_headers(res);
+
     json request_json;
     try {
         request_json = json::parse(req.body);
@@ -159,10 +175,12 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     }
 
     bool stream = request_json.value("stream", true);
+    auto now_ts = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string req_id = "chatcmpl-haven-" + std::to_string(now_ts);
 
     if (stream) {
         // Stream responses SSE
-        res.set_chunked_content_provider("text/event-stream", [chain, max_tokens](size_t offset, httplib::DataSink & sink) mutable {
+        res.set_chunked_content_provider("text/event-stream", [chain, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
             int n_decoded = 0;
             while (n_decoded < max_tokens) {
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
@@ -177,7 +195,15 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 if (len > 0) {
                     std::string token_str(buf, len);
                     json chunk = {
-                        {"choices", json::array({{{"delta", {{"content", token_str}}}}})},
+                        {"id", req_id},
+                        {"object", "chat.completion.chunk"},
+                        {"created", now_ts},
+                        {"model", g_state.active_model_alias},
+                        {"choices", json::array({{
+                            {"index", 0},
+                            {"delta", {{"content", token_str}}},
+                            {"finish_reason", nullptr}
+                        }})},
                         {"token", token_str},
                         {"content", token_str}
                     };
@@ -228,7 +254,15 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         llama_sampler_free(chain);
 
         json resp = {
-            {"choices", json::array({{{"message", {{"role", "assistant"}, {"content", full_response}}}, {"text", full_response}}})},
+            {"id", req_id},
+            {"object", "chat.completion"},
+            {"created", now_ts},
+            {"model", g_state.active_model_alias},
+            {"choices", json::array({{
+                {"index", 0},
+                {"message", {{"role", "assistant"}, {"content", full_response}}},
+                {"finish_reason", "stop"}
+            }})},
             {"content", full_response}
         };
         res.set_content(resp.dump(), "application/json");
@@ -256,8 +290,15 @@ int main(int argc, char ** argv) {
             g_state.default_n_ctx = std::stoi(argv[++i]);
         } else if ((arg == "--n-gpu-layers" || arg == "-ngl") && i + 1 < argc) {
             g_state.default_gpu_layers = std::stoi(argv[++i]);
-        } else if (arg.rfind("--", 0) == 0 || arg.rfind("-", 0) == 0) {
-            // Skip unknown flag value if present
+        } else if ((arg == "--threads" || arg == "-t") && i + 1 < argc) {
+            g_state.n_threads = std::stoi(argv[++i]);
+        } else if (arg == "--batch-size" && i + 1 < argc) {
+            g_state.n_batch = std::stoi(argv[++i]);
+        } else if (arg == "--ubatch-size" && i + 1 < argc) {
+            g_state.n_ubatch = std::stoi(argv[++i]);
+        } else if (arg == "--alias" && i + 1 < argc) {
+            g_state.active_model_alias = argv[++i];
+        } else if (arg == "--mmproj" || arg == "--n-predict") {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 ++i;
             }
@@ -266,18 +307,26 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
 
-    if (!load_model(default_model, g_state.default_gpu_layers, g_state.default_n_ctx)) {
+    if (!load_model(default_model, g_state.default_gpu_layers, g_state.default_n_ctx, g_state.n_threads, g_state.n_batch)) {
         std::cerr << "[haven-engine] Warning: Initial model load failed or file not found. Engine ready for hot-swap." << std::endl;
     }
 
     httplib::Server svr;
 
-    // 1. Health Endpoints
+    // OPTIONS preflight for CORS
+    svr.Options(".*", [](const httplib::Request &, httplib::Response & res) {
+        set_cors_headers(res);
+        res.status = 200;
+    });
+
+    // 1. Health & Models Endpoints
     auto health_handler = [](const httplib::Request &, httplib::Response & res) {
+        set_cors_headers(res);
         json response = {
             {"status", "ok"},
             {"engine", "haven-llama-cpp"},
             {"active_model", g_state.active_model_path},
+            {"alias", g_state.active_model_alias},
             {"zero_drift_sampler", true}
         };
         res.set_content(response.dump(2), "application/json");
@@ -285,13 +334,29 @@ int main(int argc, char ** argv) {
     svr.Get("/health", health_handler);
     svr.Get("/v1/health", health_handler);
 
+    svr.Get("/v1/models", [](const httplib::Request &, httplib::Response & res) {
+        set_cors_headers(res);
+        json response = {
+            {"object", "list"},
+            {"data", json::array({{
+                {"id", g_state.active_model_alias},
+                {"object", "model"},
+                {"created", 1677610602},
+                {"owned_by", "haven"}
+            }})}
+        };
+        res.set_content(response.dump(2), "application/json");
+    });
+
     // 2. Model Hot-Swap Endpoint
     svr.Post("/v1/haven/model/load", [](const httplib::Request & req, httplib::Response & res) {
+        set_cors_headers(res);
         try {
             auto body = json::parse(req.body);
             std::string model_path = body.value("model_path", "");
             int n_gpu_layers = body.value("n_gpu_layers", 99);
-            int n_ctx = body.value("n_ctx", 4096);
+            int n_ctx = body.value("n_ctx", 16384);
+            int n_threads = body.value("n_threads", g_state.n_threads);
 
             if (model_path.empty()) {
                 res.status = 400;
@@ -299,7 +364,7 @@ int main(int argc, char ** argv) {
                 return;
             }
 
-            bool success = load_model(model_path, n_gpu_layers, n_ctx);
+            bool success = load_model(model_path, n_gpu_layers, n_ctx, n_threads, g_state.n_batch);
             if (success) {
                 res.set_content("{\"status\": \"success\", \"active_model\": \"" + model_path + "\"}", "application/json");
             } else {
