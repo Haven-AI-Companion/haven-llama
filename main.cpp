@@ -133,9 +133,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         return;
     }
 
-    // Clear memory before evaluating new prompt context
+    // Clear memory sequences safely before evaluating new prompt context
     if (g_state.ctx) {
-        llama_memory_clear(llama_get_memory(g_state.ctx), true);
+        llama_memory_seq_rm(llama_get_memory(g_state.ctx), -1, 0, -1);
     }
 
     // Configure C++ Haven Sampler
