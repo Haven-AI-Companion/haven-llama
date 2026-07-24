@@ -159,7 +159,15 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     } else if (g_lower.find("male") != std::string::npos || g_lower.find("man") != std::string::npos || g_lower.find("he") != std::string::npos) {
         h_opts.user_gender = UserGender::Male;
     } else {
-        h_opts.user_gender = UserGender::Unspecified;
+        std::string p_lower = prompt;
+        std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
+        if (p_lower.find("female") != std::string::npos || p_lower.find("she/her") != std::string::npos || p_lower.find("woman") != std::string::npos) {
+            h_opts.user_gender = UserGender::Female;
+        } else if (p_lower.find("male") != std::string::npos || p_lower.find("he/him") != std::string::npos || p_lower.find("man") != std::string::npos) {
+            h_opts.user_gender = UserGender::Male;
+        } else {
+            h_opts.user_gender = UserGender::Unspecified;
+        }
     }
 
     // Tokenize prompt
