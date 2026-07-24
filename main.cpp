@@ -35,6 +35,7 @@ static void set_cors_headers(httplib::Response & res) {
     res.set_header("Access-Control-Allow-Origin", "*");
     res.set_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
     res.set_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.set_header("Connection", "close");
 }
 
 static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ctx = 16384, int n_threads = 8, int n_batch = 2048) {
