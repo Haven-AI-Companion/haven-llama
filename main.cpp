@@ -134,9 +134,11 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         return;
     }
 
-    // Synchronize context and remove sequence 0 tokens to reset KV cache position cursor to 0
-    llama_synchronize(g_state.ctx);
-    llama_memory_seq_rm(llama_get_memory(g_state.ctx), 0, 0, -1);
+    // Synchronize context and reset KV cache data buffers and metadata to position 0
+    if (g_state.ctx) {
+        llama_synchronize(g_state.ctx);
+        llama_memory_clear(llama_get_memory(g_state.ctx), true);
+    }
 
     // Identify exact token ID for <|im_end|> stop sequence
     llama_token im_end_id = LLAMA_TOKEN_NULL;
