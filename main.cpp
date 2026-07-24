@@ -188,6 +188,10 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     if (stream) {
         // Stream responses SSE with lock captured until completion
         res.set_chunked_content_provider("text/event-stream", [lock, chain, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
+            if (!chain) {
+                return false;
+            }
+
             int n_decoded = 0;
             while (n_decoded < max_tokens) {
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
@@ -231,7 +235,10 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
             std::string done_event = "data: [DONE]\n\n";
             sink.write(done_event.c_str(), done_event.length());
             sink.done();
-            llama_sampler_free(chain);
+            if (chain) {
+                llama_sampler_free(chain);
+                chain = nullptr;
+            }
             return false;
         });
     } else {
