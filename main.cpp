@@ -124,11 +124,18 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_state.engine_mutex);
+    // Acquire lock for the ENTIRE inference session to prevent concurrent segfaults
+    std::shared_ptr<std::unique_lock<std::mutex>> lock = std::make_shared<std::unique_lock<std::mutex>>(g_state.engine_mutex);
+
     if (!g_state.model || !g_state.ctx) {
         res.status = 500;
         res.set_content("{\"error\": \"No active model loaded\"}", "application/json");
         return;
+    }
+
+    // Clear memory before evaluating new prompt context
+    if (g_state.ctx) {
+        llama_memory_clear(llama_get_memory(g_state.ctx), true);
     }
 
     // Configure C++ Haven Sampler
@@ -179,8 +186,8 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     std::string req_id = "chatcmpl-haven-" + std::to_string(now_ts);
 
     if (stream) {
-        // Stream responses SSE
-        res.set_chunked_content_provider("text/event-stream", [chain, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
+        // Stream responses SSE with lock captured until completion
+        res.set_chunked_content_provider("text/event-stream", [lock, chain, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
             int n_decoded = 0;
             while (n_decoded < max_tokens) {
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
