@@ -52,7 +52,7 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
-    cparams.n_batch = 512;
+    cparams.n_batch = 2048;
 
     g_state.ctx = llama_init_from_model(g_state.model, cparams);
     if (!g_state.ctx) {
@@ -145,13 +145,17 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     llama_sampler_chain_add(chain, llama_sampler_init_temp(temp));
     llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    // Evaluate prompt tokens
-    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
-    if (llama_decode(g_state.ctx, batch) != 0) {
-        llama_sampler_free(chain);
-        res.status = 500;
-        res.set_content("{\"error\": \"llama_decode prompt failed\"}", "application/json");
-        return;
+    // Chunked prompt token evaluation (handles large prompt inputs cleanly)
+    const size_t batch_size = 512;
+    for (size_t i = 0; i < tokens.size(); i += batch_size) {
+        size_t n_eval = std::min(batch_size, tokens.size() - i);
+        llama_batch chunk_batch = llama_batch_get_one(tokens.data() + i, (int)n_eval);
+        if (llama_decode(g_state.ctx, chunk_batch) != 0) {
+            llama_sampler_free(chain);
+            res.status = 500;
+            res.set_content("{\"error\": \"llama_decode prompt failed\"}", "application/json");
+            return;
+        }
     }
 
     bool stream = request_json.value("stream", true);
