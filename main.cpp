@@ -242,6 +242,7 @@ int main(int argc, char ** argv) {
     std::cout << "==========================================================" << std::endl;
 
     std::string default_model = "C:\\Users\\admin\\gemma4-turbo-family\\haven-chat-v3.0.3.gguf";
+    g_state.port = 11436;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -255,6 +256,11 @@ int main(int argc, char ** argv) {
             g_state.default_n_ctx = std::stoi(argv[++i]);
         } else if ((arg == "--n-gpu-layers" || arg == "-ngl") && i + 1 < argc) {
             g_state.default_gpu_layers = std::stoi(argv[++i]);
+        } else if (arg.rfind("--", 0) == 0 || arg.rfind("-", 0) == 0) {
+            // Skip unknown flag value if present
+            if (i + 1 < argc && argv[i + 1][0] != '-') {
+                ++i;
+            }
         }
     }
 
