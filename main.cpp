@@ -140,7 +140,11 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
 
     // Identify exact token ID for <|im_end|> stop sequence
     llama_token im_end_id = LLAMA_TOKEN_NULL;
-    llama_tokenize(g_state.vocab, "<|im_end|>", 10, &im_end_id, 1, false, true);
+    int n_eot = llama_tokenize(g_state.vocab, "<|im_end|>", 10, &im_end_id, 1, true, true);
+    if (n_eot < 1 || im_end_id == LLAMA_TOKEN_NULL) {
+        im_end_id = 107; // Fallback to Gemma <|im_end|> token ID
+    }
+    std::cout << "[haven-engine] Identified <|im_end|> Token ID: " << im_end_id << std::endl;
 
     // Configure C++ Haven Sampler
     haven_sampler_options h_opts;
