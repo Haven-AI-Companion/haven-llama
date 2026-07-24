@@ -335,6 +335,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
             }
 
             int n_decoded = 0;
+            bool inside_thought = false;
+            std::string acc_buf = "";
+
             while (n_decoded < max_tokens) {
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
                 llama_sampler_accept(chain, id);
@@ -350,9 +353,31 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                     if (token_str.find("<|im_end|>") != std::string::npos || token_str.find("<eos>") != std::string::npos) {
                         break;
                     }
+
+                    acc_buf += token_str;
+
+                    if (acc_buf.find("<thought>") != std::string::npos || acc_buf.find("<|thought|>") != std::string::npos) {
+                        inside_thought = true;
+                    }
+
+                    if (inside_thought) {
+                        if (acc_buf.find("</thought>") != std::string::npos || acc_buf.find("<|end_thought|>") != std::string::npos) {
+                            inside_thought = false;
+                            acc_buf.clear();
+                        }
+                        // Decode next token
+                        llama_batch token_batch = llama_batch_get_one(&id, 1);
+                        if (llama_decode(g_state.ctx, token_batch) != 0) {
+                            break;
+                        }
+                        n_decoded++;
+                        continue;
+                    }
+
                     if (token_str.find("<|channel") != std::string::npos || token_str.find("<|thought") != std::string::npos || token_str.find("<|call") != std::string::npos) {
                         continue;
                     }
+
                     json chunk = {
                         {"id", req_id},
                         {"object", "chat.completion.chunk"},
