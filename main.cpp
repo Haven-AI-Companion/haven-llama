@@ -368,12 +368,12 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
 
                     acc_buf += token_str;
 
-                    if (acc_buf.find("<thought>") != std::string::npos || acc_buf.find("<|thought|>") != std::string::npos) {
+                    if (token_str.find("<thought") != std::string::npos || token_str.find("<|thought") != std::string::npos || acc_buf.find("<thought") != std::string::npos) {
                         inside_thought = true;
                     }
 
                     if (inside_thought) {
-                        if (acc_buf.find("</thought>") != std::string::npos || acc_buf.find("<|end_thought|>") != std::string::npos) {
+                        if (acc_buf.find("</thought") != std::string::npos || acc_buf.find("<|end_thought") != std::string::npos) {
                             inside_thought = false;
                             acc_buf.clear();
                         }
