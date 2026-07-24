@@ -27,6 +27,7 @@ struct HavenEngineState {
     int n_threads = 8;
     int n_batch = 2048;
     int n_ubatch = 512;
+    llama_context_params cparams;
 };
 
 static HavenEngineState g_state;
@@ -61,14 +62,14 @@ static bool load_model(const std::string & path, int n_gpu_layers = 99, int n_ct
 
     g_state.vocab = llama_model_get_vocab(g_state.model);
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = n_ctx;
-    cparams.n_batch = n_batch;
-    cparams.n_ubatch = 512;
-    cparams.n_threads = n_threads;
-    cparams.n_threads_batch = n_threads;
+    g_state.cparams = llama_context_default_params();
+    g_state.cparams.n_ctx = n_ctx;
+    g_state.cparams.n_batch = n_batch;
+    g_state.cparams.n_ubatch = 512;
+    g_state.cparams.n_threads = n_threads;
+    g_state.cparams.n_threads_batch = n_threads;
 
-    g_state.ctx = llama_init_from_model(g_state.model, cparams);
+    g_state.ctx = llama_init_from_model(g_state.model, g_state.cparams);
     if (!g_state.ctx) {
         std::cerr << "[haven-engine] Failed to initialize llama_context." << std::endl;
         llama_model_free(g_state.model);
@@ -127,17 +128,26 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     // Acquire lock for the ENTIRE inference session to prevent concurrent segfaults
     std::shared_ptr<std::unique_lock<std::mutex>> lock = std::make_shared<std::unique_lock<std::mutex>>(g_state.engine_mutex);
 
-    if (!g_state.model || !g_state.ctx) {
+    if (!g_state.model) {
         res.status = 500;
         res.set_content("{\"error\": \"No active model loaded\"}", "application/json");
         return;
     }
 
-    // Synchronize context and clear memory metadata before evaluating new prompt context
+    // Create fresh context for 100% deterministic multi-turn safety (~7ms execution)
     if (g_state.ctx) {
-        llama_synchronize(g_state.ctx);
-        llama_memory_clear(llama_get_memory(g_state.ctx), false);
+        llama_free(g_state.ctx);
     }
+    g_state.ctx = llama_init_from_model(g_state.model, g_state.cparams);
+    if (!g_state.ctx) {
+        res.status = 500;
+        res.set_content("{\"error\": \"Failed to re-initialize context\"}", "application/json");
+        return;
+    }
+
+    // Identify exact token ID for <|im_end|> stop sequence
+    llama_token im_end_id = LLAMA_TOKEN_NULL;
+    llama_tokenize(g_state.vocab, "<|im_end|>", 10, &im_end_id, 1, false, true);
 
     // Configure C++ Haven Sampler
     haven_sampler_options h_opts;
@@ -188,7 +198,7 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
 
     if (stream) {
         // Stream responses SSE with lock captured until completion
-        res.set_chunked_content_provider("text/event-stream", [lock, chain, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
+        res.set_chunked_content_provider("text/event-stream", [lock, chain, im_end_id, max_tokens, req_id, now_ts](size_t offset, httplib::DataSink & sink) mutable {
             if (!chain) {
                 return false;
             }
@@ -198,7 +208,7 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
                 llama_sampler_accept(chain, id);
 
-                if (llama_vocab_is_eog(g_state.vocab, id) || id == llama_vocab_eot(g_state.vocab)) {
+                if (llama_vocab_is_eog(g_state.vocab, id) || id == im_end_id) {
                     break;
                 }
 
@@ -253,13 +263,17 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
             llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
             llama_sampler_accept(chain, id);
 
-            if (llama_vocab_is_eog(g_state.vocab, id)) {
+            if (llama_vocab_is_eog(g_state.vocab, id) || id == im_end_id) {
                 break;
             }
 
             char buf[256];
             int len = llama_token_to_piece(g_state.vocab, id, buf, sizeof(buf), 0, true);
             if (len > 0) {
+                std::string token_str(buf, len);
+                if (token_str.find("<|im_end|>") != std::string::npos || token_str.find("<eos>") != std::string::npos) {
+                    break;
+                }
                 full_response.append(buf, len);
             }
 
