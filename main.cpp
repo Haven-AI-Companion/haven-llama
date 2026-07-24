@@ -283,6 +283,18 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
     }
     tokens.resize(n_tokens);
 
+    // Context Window Sliding Guard (prevents 500 context overflow crashes)
+    size_t max_allowed_prompt = (g_state.default_n_ctx > max_tokens + 512) ? (g_state.default_n_ctx - max_tokens - 256) : 12000;
+    if (tokens.size() > max_allowed_prompt) {
+        std::cout << "[haven-engine] Warning: Prompt tokens (" << tokens.size() << ") exceed max allowed (" << max_allowed_prompt << "). Sliding context window." << std::endl;
+        size_t excess = tokens.size() - max_allowed_prompt;
+        size_t system_len = std::min((size_t)500, tokens.size() / 4);
+        std::vector<llama_token> slid_tokens;
+        slid_tokens.insert(slid_tokens.end(), tokens.begin(), tokens.begin() + system_len);
+        slid_tokens.insert(slid_tokens.end(), tokens.begin() + system_len + excess, tokens.end());
+        tokens = slid_tokens;
+    }
+
     // Build Full Sampler Chain (Haven Zero-Drift + Penalties + Min-P + Top-P + Temp)
     struct llama_sampler * haven_smpl = llama_sampler_init_haven(g_state.vocab, h_opts);
     struct llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
