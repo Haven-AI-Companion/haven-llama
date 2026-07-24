@@ -133,8 +133,9 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
         return;
     }
 
-    // Clear memory metadata and reset position cursor to 0 before evaluating new prompt context
+    // Synchronize context and clear memory metadata before evaluating new prompt context
     if (g_state.ctx) {
+        llama_synchronize(g_state.ctx);
         llama_memory_clear(llama_get_memory(g_state.ctx), false);
     }
 
@@ -197,7 +198,7 @@ static void handle_chat_completion(const httplib::Request & req, httplib::Respon
                 llama_token id = llama_sampler_sample(chain, g_state.ctx, -1);
                 llama_sampler_accept(chain, id);
 
-                if (llama_vocab_is_eog(g_state.vocab, id)) {
+                if (llama_vocab_is_eog(g_state.vocab, id) || id == llama_vocab_eot(g_state.vocab)) {
                     break;
                 }
 
