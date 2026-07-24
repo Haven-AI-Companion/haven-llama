@@ -60,11 +60,10 @@ static struct llama_sampler * haven_sampler_clone(const struct llama_sampler * s
 }
 
 static void haven_sampler_free(struct llama_sampler * smpl) {
-    if (smpl->ctx) {
+    if (smpl && smpl->ctx) {
         delete (haven_sampler_ctx *) smpl->ctx;
         smpl->ctx = nullptr;
     }
-    delete smpl;
 }
 
 static struct llama_sampler_i haven_sampler_i = {
